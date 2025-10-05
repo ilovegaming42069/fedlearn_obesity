@@ -8,6 +8,10 @@ from sklearn.model_selection import train_test_split
 import argparse
 import boto3
 from io import StringIO
+import matplotlib.pyplot as plt
+import numpy as np
+import random
+from sklearn.metrics import precision_score, recall_score, f1_score, confusion_matrix, classification_report
 
 # Neural network with dynamic number of output classes
 class ObesityNet(nn.Module):
@@ -66,17 +70,31 @@ def load_dataset_from_s3(bucket_name, s3_key):
 # Function to evaluate the model on the test set
 def evaluate_model(global_model, test_loader):
     global_model.eval()  # Set model to evaluation mode
-    correct = 0
-    total = 0
+    all_predictions = []
+    all_targets = []
+    
     with torch.no_grad():  # Disable gradient calculation (we're just evaluating)
         for data, target in test_loader:
-            output = global_model(data)  # Forward pass (no need for unsqueeze)
+            output = global_model(data)  # Forward pass
             _, predicted = torch.max(output.data, 1)  # Get the predicted class
-            total += target.size(0)  # Total number of examples
-            correct += (predicted == target).sum().item()  # Count correct predictions
+            all_predictions.extend(predicted.cpu().numpy())
+            all_targets.extend(target.cpu().numpy())
     
-    accuracy = 100 * correct / total  # Calculate accuracy
-    return accuracy
+    # Calculate metrics
+    accuracy = 100 * sum([1 for p, t in zip(all_predictions, all_targets) if p == t]) / len(all_targets)
+    
+    # Calculate precision, recall, and F1-score
+    precision = precision_score(all_targets, all_predictions, average='weighted', zero_division=0)
+    recall = recall_score(all_targets, all_predictions, average='weighted', zero_division=0)
+    f1 = f1_score(all_targets, all_predictions, average='weighted', zero_division=0)
+
+    
+    return {
+        'accuracy': accuracy,
+        'precision': precision * 100,  # Convert to percentage
+        'recall': recall * 100,
+        'f1_score': f1 * 100
+    }
 
 if __name__ == "__main__":
     # Parse arguments for hyperparameters
@@ -174,6 +192,7 @@ if __name__ == "__main__":
         criterion = nn.CrossEntropyLoss()
 
     # Federated learning parameters
+    federated_accuracies = []
     for epoch in range(args.epochs):
         client_models = []
         client_optimizers = []
@@ -208,8 +227,10 @@ if __name__ == "__main__":
                 weights = weights.unsqueeze(-1)
             global_state_dict[key] = (stacked * weights).sum(0)
         global_model.load_state_dict(global_state_dict)
+        metrics = evaluate_model(global_model, test_loader)
+        federated_accuracies.append(metrics["accuracy"])
 
-        print(f'Epoch {epoch + 1}, Client Losses: {client_losses}, Global Model Loss: {sum(client_losses) / num_clients}')
+        print(f'Epoch {epoch + 1}, Client Losses: {client_losses}, Global Model Loss: {sum(client_losses) / num_clients}, Accuracy: {metrics["accuracy"]:.2f}%')
 
     # Save the model either locally or to S3 after training
     if args.local_model_path:
@@ -220,6 +241,111 @@ if __name__ == "__main__":
             raise ValueError("Either --local_model_path or both --s3_model_bucket and --s3_model_key must be provided to save the model.")
         save_model_to_s3(global_model, args.s3_model_bucket, args.s3_model_key)
 
+    #Non - Federated learning Method (for accuracy Comparison)
+    non_federated_model = ObesityNet(input_size, num_classes)
+    optimizer = optim.SGD(non_federated_model.parameters(), lr=args.learning_rate)
+
+    non_federated_accuracies = []  
+    full_train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
+    full_train_loader = DataLoader(full_train_dataset, batch_size=32, shuffle=True)
+    
+    for epoch in range(args.epochs):
+        non_federated_model.train()
+        epoch_loss = 0
+        for data, target in full_train_loader:
+            optimizer.zero_grad()
+            output = non_federated_model(data)
+            loss = criterion(output, target)
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item()
+        
+        metrics_nf = evaluate_model(non_federated_model, test_loader)
+        non_federated_accuracies.append(metrics_nf["accuracy"])
+
+        if (epoch + 1) % 100 == 0:
+            print(f'Non-Federated Epoch {epoch + 1}/{args.epochs}, Loss: {epoch_loss/len(full_train_loader):.4f}, Accuracy: {metrics_nf["accuracy"]:.2f}%')
+
+    federated_accuracy = federated_accuracies[-1]
+    non_federated_accuracy = non_federated_accuracies[-1]
     # Evaluate the federated global model on the test set
-    test_accuracy = evaluate_model(global_model, test_loader)
-    print(f'Federated Learning Model Test Accuracy: {test_accuracy:.2f}%')
+    metrics = evaluate_model(global_model, test_loader)
+    
+         
+    print("\n" + "="*60)
+    print("FINAL MODEL PERFORMANCE METRICS")
+    print("="*60)
+    print(f'Accuracy:  {metrics["accuracy"]:.2f}%')
+    print(f'Precision: {metrics["precision"]:.2f}%')
+    print(f'Recall:    {metrics["recall"]:.2f}%')
+    print(f'F1-Score:  {metrics["f1_score"]:.2f}%')
+    print("="*60)
+
+    print(f"\nFinal Federated Model Accuracy: {federated_accuracy:.2f}%")
+    print(f"Final Non-Federated Model Accuracy: {non_federated_accuracy:.2f}%")
+
+     # --- Plotting Accuracy Comparison ---
+    plt.figure(figsize=(12, 7))
+    epochs_range = range(1, args.epochs + 1)
+
+    plt.plot(epochs_range, federated_accuracies, 'r.-', label='Federated Accuracy')
+    plt.plot(epochs_range, non_federated_accuracies, 'b.-', label='Non-Federated Accuracy')
+
+    title_str = (f'Accuracy Comparison (Federated vs Non-Federated)\n'
+                 f'(Final Federated: {federated_accuracy:.2f}%, Non-Federated: {non_federated_accuracy:.2f}%)')
+    plt.title(title_str)
+    plt.xlabel('Epochs')
+    plt.ylabel('Accuracy (%)')
+    plt.grid(True)
+    plt.legend()
+    plt.show()
+
+
+    #Plotting Federated vs Non-Federated Accuracy from 3 Random Clients
+    client_indices = random.sample(range(num_clients), min(3, num_clients))
+
+    for client_id in client_indices:
+        print(f"\nTraining Non-Federated Model for Client {client_id+1}...")
+
+        # Create client-specific dataset
+        client_dataset = TensorDataset(X_train_chunks[client_id], y_train_chunks[client_id])
+        client_loader = DataLoader(client_dataset, batch_size=32, shuffle=True)
+
+        # Re-initialize a fresh model for this client
+        client_model = ObesityNet(input_size, num_classes)
+        client_optimizer = optim.SGD(client_model.parameters(), lr=args.learning_rate)
+        
+        # Track accuracies
+        client_nonfl_accuracies = []
+        
+        for epoch in range(args.epochs):
+            client_model.train()
+            for data, target in client_loader:
+                client_optimizer.zero_grad()
+                output = client_model(data)
+                loss = criterion(output, target)
+                loss.backward()
+                client_optimizer.step()
+            
+            # Evaluate client model on the global test set
+            metrics_client = evaluate_model(client_model, test_loader)
+            client_nonfl_accuracies.append(metrics_client["accuracy"])
+    
+        # --- Plotting for this client ---
+        plt.figure(figsize=(10, 6))
+        epochs_range = range(1, args.epochs + 1)
+
+        plt.plot(epochs_range, federated_accuracies, 'r-', label='Federated (Global)')
+        plt.plot(epochs_range, client_nonfl_accuracies, 'b-', label=f'Client {client_id+1} Non-FL')
+
+        title_str = (f'Client {client_id+1}: Federated vs Non-Federated Accuracy\n'
+                    f'(Final FL: {federated_accuracies[-1]:.2f}%, '
+                    f'Client Non-FL: {client_nonfl_accuracies[-1]:.2f}%)')
+        plt.title(title_str)
+        plt.xlabel('Epochs')
+        plt.ylabel('Accuracy (%)')
+        plt.grid(True)
+        plt.legend()
+        plt.show()
+
+
